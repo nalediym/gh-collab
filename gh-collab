@@ -1,35 +1,365 @@
 #!/usr/bin/env bash
-set -e
+# ==============================================================================
+# gh-collab - A GitHub CLI extension to manage repository collaborators
+# ==============================================================================
+# 
+# WHAT THIS SCRIPT DOES:
+#   Adds a GitHub user as a collaborator to a repository using the GitHub API.
+#   Think of it like: "yo, let this person access my private repo"
+#
+# USAGE:
+#   gh collab add <username>                    # add to current repo
+#   gh collab add <username> -R owner/repo      # add to specific repo
+#
+# PYTHON EQUIVALENT (if this were Python):
+#   import subprocess
+#   subprocess.run(["gh", "api", f"repos/{owner}/{repo}/collaborators/{user}", "-X", "PUT"])
+#
+# AUTHOR: nalediym
+# REPO: https://github.com/nalediym/gh-collab
+# ==============================================================================
 
-echo "Hello gh-collab!"
+# ------------------------------------------------------------------------------
+# Bash settings (like Python's "strict mode")
+# ------------------------------------------------------------------------------
+# In Python, errors raise exceptions by default. Bash doesn't do that unless
+# we tell it to. These settings make bash behave more like Python:
 
-# Snippets to help get started:
+set -e          # Exit immediately if any command fails (like raising an exception)
+                # Without this, bash would just... keep going. Chaos.
+                # Python equivalent: every line is implicitly in a try block that re-raises
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
+set -o pipefail # If a piped command fails, the whole pipe fails
+                # Example: "cmd1 | cmd2" fails if cmd1 fails, not just cmd2
+                # Without this: "false | echo hi" would succeed (!)
+
+# ------------------------------------------------------------------------------
+# COLORS (for pretty output)
+# ------------------------------------------------------------------------------
+# These are ANSI escape codes. When you print them, the terminal changes colors.
+# We check if stdout is a terminal (tty) - if not (like when piping), no colors.
+#
+# Python equivalent:
+#   if sys.stdout.isatty():
+#       RED = "\033[0;31m"
+#   else:
+#       RED = ""
+
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'  # NC = "No Color" - resets the color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
+
+# ------------------------------------------------------------------------------
+# CONFIGURATION / DEFAULTS
+# ------------------------------------------------------------------------------
+# The permission level for new collaborators
+# Options: pull (read), push (write), admin, maintain, triage
+DEFAULT_PERMISSION="push"
+
+# TODO: Make this configurable via --permission flag
+# TODO: Add a config file option (~/.config/gh-collab/config) for user defaults
+# FIXME: Should we default to "pull" for safety? Discuss with users.
+
+# ------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------------------
+
+# Print usage/help information
+# In Python, this would be like argparse's auto-generated help, but we write it manually
+# The 'cat << EOF' syntax is called a "heredoc" - it prints everything until 'EOF'
+# Think of it like a multi-line f-string in Python
+show_help() {
+    cat << EOF
+${BLUE}gh-collab${NC} - Manage repository collaborators from the command line
+
+${YELLOW}USAGE:${NC}
+    gh collab add <username>                 Add collaborator to current repo
+    gh collab add <username> -R owner/repo   Add collaborator to specific repo
+
+${YELLOW}OPTIONS:${NC}
+    -R, --repo <owner/repo>    Target repository (default: current repo)
+    -h, --help                 Show this help message
+
+${YELLOW}EXAMPLES:${NC}
+    gh collab add octocat
+    gh collab add octocat -R myorg/myrepo
+
+${YELLOW}PERMISSION LEVELS:${NC}
+    Currently defaults to "push" (write access).
+    
+${YELLOW}FUTURE COMMANDS:${NC} (not yet implemented - PRs welcome!)
+    gh collab remove <username>      Remove a collaborator
+    gh collab list                   List all collaborators
+    gh collab check <username>       Check if user is a collaborator
+EOF
+}
+
+# Print an error message in red and exit with code 1
+# Similar to Python's: raise SystemExit(f"Error: {message}")
+#
+# The >&2 redirects output to stderr (standard error) instead of stdout
+# Python equivalent: print(f"Error: {message}", file=sys.stderr)
+die() {
+    echo -e "${RED}Error:${NC} $1" >&2
+    exit 1
+}
+
+# Print an info message in blue
+# Just for pretty output, nothing fancy
+info() {
+    echo -e "${BLUE}=>${NC} $1"
+}
+
+# Print a success message in green
+success() {
+    echo -e "${GREEN}=>${NC} $1"
+}
+
+# Print a warning message in yellow
+warn() {
+    echo -e "${YELLOW}Warning:${NC} $1"
+}
+
+# Detect the current repository from git remote
+# Returns format: "owner/repo"
+#
+# This uses the gh CLI to ask "what repo am I currently in?"
+# It's smart - it looks at your git remotes and figures it out
+#
+# The 2>/dev/null suppresses error messages (like stderr going to /dev/null)
+# Python equivalent: 
+#   try:
+#       result = subprocess.run([...], capture_output=True)
+#       return result.stdout
+#   except:
+#       return None
+get_current_repo() {
+    gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# ARGUMENT PARSING
+# ------------------------------------------------------------------------------
+# In Python you'd use argparse or click. In bash, we manually loop through args.
+#
+# $@ is like sys.argv[1:] - all arguments passed to the script
+# $# is like len(sys.argv[1:]) - the count of arguments
+# $1, $2, etc. are like sys.argv[1], sys.argv[2], etc.
+#
+# 'shift' removes the first argument, so $2 becomes $1, $3 becomes $2, etc.
+# It's like: args.pop(0) in Python
+
+SUBCOMMAND=""       # Will be "add" (or future: "remove", "list")
+USERNAME=""         # The GitHub username to add
+REPO=""             # The target repository (owner/repo format)
+
+# Loop through all arguments
+# [[ $# -gt 0 ]] means "while argument count > 0"
+# Python equivalent: while len(args) > 0:
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        # -----------------
+        # Help flags
+        # -----------------
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        
+        # -----------------
+        # Repository flag (takes next argument as value)
+        # -----------------
+        # The -R flag is followed by the repo name, so we need $2
+        -R|--repo)
+            # Check that there IS a next argument
+            if [[ -z "$2" || "$2" == -* ]]; then
+                die "-R requires a repository argument (e.g., -R owner/repo)"
+            fi
+            REPO="$2"       # $2 is the next argument after -R
+            shift 2         # Remove TWO args: -R and its value
+            ;;
+        
+        # -----------------
+        # Subcommands
+        # -----------------
+        add)
+            SUBCOMMAND="add"
+            shift           # Remove this argument, move to next
+            ;;
+        
+        # TODO: Add "remove" subcommand
+        # remove)
+        #     SUBCOMMAND="remove"
+        #     shift
+        #     ;;
+        
+        # TODO: Add "list" subcommand
+        # list)
+        #     SUBCOMMAND="list"
+        #     shift
+        #     ;;
+        
+        # TODO: Add "check" subcommand to see if user is already a collaborator
+        # check)
+        #     SUBCOMMAND="check"
+        #     shift
+        #     ;;
+        
+        # -----------------
+        # Unknown flags (start with -)
+        # -----------------
+        -*)
+            die "Unknown option: $1 (try --help)"
+            ;;
+        
+        # -----------------
+        # Positional arguments (don't start with -)
+        # -----------------
+        *)
+            # If we already have a subcommand, this is probably the username
+            if [[ -n "$SUBCOMMAND" && -z "$USERNAME" ]]; then
+                USERNAME="$1"
+            elif [[ -z "$SUBCOMMAND" ]]; then
+                # No subcommand yet - maybe they forgot?
+                die "Unknown command: $1. Did you mean 'gh collab add $1'?"
+            else
+                die "Unexpected argument: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------------------------
+# Make sure we have everything we need before making API calls
+# This is like having a bunch of "if not x: raise ValueError(...)" in Python
+
+# Must have a subcommand
+if [[ -z "$SUBCOMMAND" ]]; then
+    # No command given - show help
+    show_help
+    exit 0
+fi
+
+# For "add" command, we need a username
+if [[ "$SUBCOMMAND" == "add" && -z "$USERNAME" ]]; then
+    die "Username required. Usage: gh collab add <username>"
+fi
+
+# If no repo specified, try to detect from current directory
+if [[ -z "$REPO" ]]; then
+    info "No repo specified, detecting from current directory..."
+    REPO=$(get_current_repo) || die "Not in a git repo. Use -R owner/repo to specify."
+    info "Detected repo: ${BLUE}${REPO}${NC}"
+fi
+
+# Validate repo format (should be owner/repo)
+# The regex ^[^/]+/[^/]+$ means:
+#   ^ = start of string
+#   [^/]+ = one or more characters that are NOT a slash
+#   / = a literal slash
+#   [^/]+ = one or more characters that are NOT a slash
+#   $ = end of string
+# So it matches "owner/repo" but not "owner" or "owner/repo/extra"
+if [[ ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
+    die "Invalid repo format: '$REPO'. Expected: owner/repo"
+fi
+
+# ------------------------------------------------------------------------------
+# MAIN LOGIC
+# ------------------------------------------------------------------------------
+# This is where the actual work happens!
+
+# Handle the "add" subcommand
+if [[ "$SUBCOMMAND" == "add" ]]; then
+    info "Adding '${YELLOW}${USERNAME}${NC}' as collaborator to '${BLUE}${REPO}${NC}'..."
+    
+    # Make the API call!
+    # GitHub API endpoint: PUT /repos/{owner}/{repo}/collaborators/{username}
+    # Docs: https://docs.github.com/en/rest/collaborators/collaborators#add-a-repository-collaborator
+    # 
+    # --method PUT = HTTP PUT request (creates or updates)
+    # --field permission=X = sends JSON body {"permission": "X"}
+    # --silent = don't print the response body (we just care if it worked)
+    #
+    # FIXME: The API returns different status codes we should handle:
+    #   - 201: Invitation created (new collaborator)
+    #   - 204: User is already a collaborator (no change)
+    #   - 422: Validation failed (user might not exist)
+    #
+    # TODO: Add --permission flag to override DEFAULT_PERMISSION
+    # TODO: Show invitation status/link after adding
+    
+    if gh api "repos/${REPO}/collaborators/${USERNAME}" \
+        --method PUT \
+        --field permission="$DEFAULT_PERMISSION" \
+        --silent; then
+        
+        success "Invitation sent to '${YELLOW}${USERNAME}${NC}' for '${BLUE}${REPO}${NC}'"
+        echo ""
+        echo "They'll receive an email invitation and need to accept it."
+        echo "You can also share this link with them:"
+        echo "  ${BLUE}https://github.com/${REPO}/invitations${NC}"
+        
+        # TODO: Check if user was already a collaborator (204 response)
+        # TODO: Show their current permission level
+    else
+        # The gh api command failed - could be many reasons
+        # Common ones:
+        #   - Repo doesn't exist
+        #   - You don't have admin access to the repo
+        #   - Username doesn't exist
+        #   - Rate limited
+        die "Failed to add collaborator. Possible causes:
+  - The repo '${REPO}' doesn't exist or you don't have access
+  - You don't have admin permissions on the repo
+  - The username '${USERNAME}' doesn't exist on GitHub
+  - You might be rate limited (try again later)"
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# FUTURE SUBCOMMANDS (not implemented yet)
+# ------------------------------------------------------------------------------
+# These are stubbed out for future development. Remove the comments and
+# implement them when you're ready!
+
+# TODO: Implement "remove" subcommand
+# if [[ "$SUBCOMMAND" == "remove" ]]; then
+#     info "Removing '${USERNAME}' from '${REPO}'..."
+#     if gh api "repos/${REPO}/collaborators/${USERNAME}" --method DELETE --silent; then
+#         success "Removed '${USERNAME}' from '${REPO}'"
+#     else
+#         die "Failed to remove collaborator"
+#     fi
 # fi
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+# TODO: Implement "list" subcommand  
+# if [[ "$SUBCOMMAND" == "list" ]]; then
+#     info "Collaborators for '${REPO}':"
+#     # The --jq flag uses jq syntax to format JSON output
+#     # .[].login extracts the 'login' field from each item in the array
+#     gh api "repos/${REPO}/collaborators" --jq '.[] | "\(.login) (\(.role_name))"'
+# fi
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+# TODO: Implement "check" subcommand
+# if [[ "$SUBCOMMAND" == "check" ]]; then
+#     # This endpoint returns 204 if user is collaborator, 404 if not
+#     if gh api "repos/${REPO}/collaborators/${USERNAME}" --silent 2>/dev/null; then
+#         success "'${USERNAME}' is a collaborator on '${REPO}'"
+#     else
+#         warn "'${USERNAME}' is NOT a collaborator on '${REPO}'"
+#     fi
+# fi
