@@ -66,9 +66,7 @@ fi
 # Options: pull (read), push (write), admin, maintain, triage
 DEFAULT_PERMISSION="push"
 
-# TODO: Make this configurable via --permission flag
 # TODO: Add a config file option (~/.config/gh-collab/config) for user defaults
-# FIXME: Should we default to "pull" for safety? Discuss with users.
 
 # ------------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -83,24 +81,35 @@ show_help() {
 ${BLUE}gh-collab${NC} - Manage repository collaborators from the command line
 
 ${YELLOW}USAGE:${NC}
-    gh collab add <username>                 Add collaborator to current repo
-    gh collab add <username> -R owner/repo   Add collaborator to specific repo
+    gh collab add <user> [user2 ...]         Add collaborator(s) to current repo
+    gh collab add <user> -R owner/repo       Add collaborator(s) to specific repo
+    gh collab remove <user> [user2 ...]      Remove collaborator(s)
+    gh collab list                           List all collaborators
+    gh collab check <user> [user2 ...]       Check if user(s) are collaborators
 
 ${YELLOW}OPTIONS:${NC}
-    -R, --repo <owner/repo>    Target repository (default: current repo)
-    -h, --help                 Show this help message
-
-${YELLOW}EXAMPLES:${NC}
-    gh collab add octocat
-    gh collab add octocat -R myorg/myrepo
+    -R, --repo <owner/repo>       Target repository (default: current repo)
+    -p, --permission <level>      Permission level (default: push)
+    -h, --help                    Show this help message
 
 ${YELLOW}PERMISSION LEVELS:${NC}
-    Currently defaults to "push" (write access).
-    
-${YELLOW}FUTURE COMMANDS:${NC} (not yet implemented - PRs welcome!)
-    gh collab remove <username>      Remove a collaborator
-    gh collab list                   List all collaborators
-    gh collab check <username>       Check if user is a collaborator
+    pull      Read-only access
+    push      Read and write access (default)
+    admin     Full admin access
+    maintain  Manage repo without admin access
+    triage    Manage issues and PRs without write access
+
+${YELLOW}EXAMPLES:${NC}
+    gh collab add octocat                        # Add with default (push) permission
+    gh collab add octocat --permission admin     # Add with admin permission
+    gh collab add octocat -R myorg/myrepo        # Add to specific repo
+    gh collab add alice bob charlie              # Batch add multiple users
+    gh collab remove octocat                     # Remove collaborator
+    gh collab remove alice bob                   # Batch remove multiple users
+    gh collab list                               # List all collaborators
+    gh collab list -R myorg/myrepo               # List collaborators for specific repo
+    gh collab check octocat                      # Check if user is a collaborator
+    gh collab check alice bob                    # Check multiple users
 EOF
 }
 
@@ -159,9 +168,10 @@ get_current_repo() {
 # 'shift' removes the first argument, so $2 becomes $1, $3 becomes $2, etc.
 # It's like: args.pop(0) in Python
 
-SUBCOMMAND=""       # Will be "add" (or future: "remove", "list")
-USERNAME=""         # The GitHub username to add
+SUBCOMMAND=""       # Will be "add", "remove", "list", "check"
+USERNAMES=()        # Array of GitHub usernames to add/remove/check
 REPO=""             # The target repository (owner/repo format)
+PERMISSION=""       # Permission level (pull/push/admin/maintain/triage)
 
 # Loop through all arguments
 # [[ $# -gt 0 ]] means "while argument count > 0"
@@ -190,6 +200,21 @@ while [[ $# -gt 0 ]]; do
             ;;
         
         # -----------------
+        # Permission flag (takes next argument as value)
+        # -----------------
+        -p|--permission)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                die "--permission requires an argument (pull/push/admin/maintain/triage)"
+            fi
+            # Validate permission value
+            if [[ ! "$2" =~ ^(pull|push|admin|maintain|triage)$ ]]; then
+                die "Invalid permission: '$2'. Must be one of: pull, push, admin, maintain, triage"
+            fi
+            PERMISSION="$2"
+            shift 2
+            ;;
+        
+        # -----------------
         # Subcommands
         # -----------------
         add)
@@ -197,23 +222,20 @@ while [[ $# -gt 0 ]]; do
             shift           # Remove this argument, move to next
             ;;
         
-        # TODO: Add "remove" subcommand
-        # remove)
-        #     SUBCOMMAND="remove"
-        #     shift
-        #     ;;
+        remove)
+            SUBCOMMAND="remove"
+            shift
+            ;;
         
-        # TODO: Add "list" subcommand
-        # list)
-        #     SUBCOMMAND="list"
-        #     shift
-        #     ;;
+        list)
+            SUBCOMMAND="list"
+            shift
+            ;;
         
-        # TODO: Add "check" subcommand to see if user is already a collaborator
-        # check)
-        #     SUBCOMMAND="check"
-        #     shift
-        #     ;;
+        check)
+            SUBCOMMAND="check"
+            shift
+            ;;
         
         # -----------------
         # Unknown flags (start with -)
@@ -226,14 +248,12 @@ while [[ $# -gt 0 ]]; do
         # Positional arguments (don't start with -)
         # -----------------
         *)
-            # If we already have a subcommand, this is probably the username
-            if [[ -n "$SUBCOMMAND" && -z "$USERNAME" ]]; then
-                USERNAME="$1"
-            elif [[ -z "$SUBCOMMAND" ]]; then
+            # If we already have a subcommand, this is probably a username
+            if [[ -n "$SUBCOMMAND" ]]; then
+                USERNAMES+=("$1")
+            else
                 # No subcommand yet - maybe they forgot?
                 die "Unknown command: $1. Did you mean 'gh collab add $1'?"
-            else
-                die "Unexpected argument: $1"
             fi
             shift
             ;;
@@ -253,9 +273,9 @@ if [[ -z "$SUBCOMMAND" ]]; then
     exit 0
 fi
 
-# For "add" command, we need a username
-if [[ "$SUBCOMMAND" == "add" && -z "$USERNAME" ]]; then
-    die "Username required. Usage: gh collab add <username>"
+# For "add", "remove", "check" commands, we need at least one username
+if [[ "$SUBCOMMAND" =~ ^(add|remove|check)$ && ${#USERNAMES[@]} -eq 0 ]]; then
+    die "Username required. Usage: gh collab $SUBCOMMAND <username> [username2 ...]"
 fi
 
 # If no repo specified, try to detect from current directory
@@ -284,50 +304,67 @@ fi
 
 # Handle the "add" subcommand
 if [[ "$SUBCOMMAND" == "add" ]]; then
-    info "Adding '${YELLOW}${USERNAME}${NC}' as collaborator to '${BLUE}${REPO}${NC}'..."
+    # Use specified permission or fall back to default
+    PERM="${PERMISSION:-$DEFAULT_PERMISSION}"
+    FAILED=0
     
-    # Make the API call!
-    # GitHub API endpoint: PUT /repos/{owner}/{repo}/collaborators/{username}
-    # Docs: https://docs.github.com/en/rest/collaborators/collaborators#add-a-repository-collaborator
-    # 
-    # --method PUT = HTTP PUT request (creates or updates)
-    # --field permission=X = sends JSON body {"permission": "X"}
-    # --silent = don't print the response body (we just care if it worked)
-    #
-    # FIXME: The API returns different status codes we should handle:
-    #   - 201: Invitation created (new collaborator)
-    #   - 204: User is already a collaborator (no change)
-    #   - 422: Validation failed (user might not exist)
-    #
-    # TODO: Add --permission flag to override DEFAULT_PERMISSION
-    # TODO: Show invitation status/link after adding
-    
-    if gh api "repos/${REPO}/collaborators/${USERNAME}" \
-        --method PUT \
-        --field permission="$DEFAULT_PERMISSION" \
-        --silent; then
+    for USERNAME in "${USERNAMES[@]}"; do
+        info "Adding '${YELLOW}${USERNAME}${NC}' as collaborator to '${BLUE}${REPO}${NC}' with ${GREEN}${PERM}${NC} permission..."
         
-        success "Invitation sent to '${YELLOW}${USERNAME}${NC}' for '${BLUE}${REPO}${NC}'"
+        # Make the API call!
+        # GitHub API endpoint: PUT /repos/{owner}/{repo}/collaborators/{username}
+        # Docs: https://docs.github.com/en/rest/collaborators/collaborators#add-a-repository-collaborator
+        # 
+        # --method PUT = HTTP PUT request (creates or updates)
+        # --field permission=X = sends JSON body {"permission": "X"}
+        # --silent = don't print the response body (we just care if it worked)
+        #
+        # Note: The API returns different status codes:
+        #   - 201: Invitation created (new collaborator)
+        #   - 204: User is already a collaborator (permission updated)
+        #   - 422: Validation failed (user might not exist)
+        
+        # Capture HTTP status code to differentiate responses
+        HTTP_STATUS=$(gh api "repos/${REPO}/collaborators/${USERNAME}" \
+            --method PUT \
+            --field permission="$PERM" \
+            --silent \
+            --include 2>&1 | grep -i "^HTTP/" | tail -1 | awk '{print $2}') || true
+        
+        if [[ "$HTTP_STATUS" == "201" ]]; then
+            success "Invitation sent to '${YELLOW}${USERNAME}${NC}'"
+        elif [[ "$HTTP_STATUS" == "204" ]]; then
+            success "'${YELLOW}${USERNAME}${NC}' is already a collaborator (permission updated to ${GREEN}${PERM}${NC})"
+        elif [[ -n "$HTTP_STATUS" && "$HTTP_STATUS" =~ ^2 ]]; then
+            # Some other 2xx success
+            success "Collaborator '${YELLOW}${USERNAME}${NC}' added"
+        else
+            # The gh api command failed
+            warn "Failed to add '${YELLOW}${USERNAME}${NC}' - user may not exist or you lack permission"
+            FAILED=$((FAILED + 1))
+        fi
+    done
+    
+    # Show summary for batch operations
+    if [[ ${#USERNAMES[@]} -gt 1 ]]; then
         echo ""
-        echo "They'll receive an email invitation and need to accept it."
-        echo "You can also share this link with them:"
-        echo "  ${BLUE}https://github.com/${REPO}/invitations${NC}"
-        
-        # TODO: Check if user was already a collaborator (204 response)
-        # TODO: Show their current permission level
-    else
-        # The gh api command failed - could be many reasons
-        # Common ones:
-        #   - Repo doesn't exist
-        #   - You don't have admin access to the repo
-        #   - Username doesn't exist
-        #   - Rate limited
-        die "Failed to add collaborator. Possible causes:
-  - The repo '${REPO}' doesn't exist or you don't have access
-  - You don't have admin permissions on the repo
-  - The username '${USERNAME}' doesn't exist on GitHub
-  - You might be rate limited (try again later)"
+        SUCCEEDED=$((${#USERNAMES[@]} - FAILED))
+        if [[ $FAILED -eq 0 ]]; then
+            success "All ${SUCCEEDED} collaborators added successfully!"
+        else
+            warn "${SUCCEEDED} succeeded, ${FAILED} failed"
+        fi
     fi
+    
+    # Show invitation link
+    if [[ $FAILED -lt ${#USERNAMES[@]} ]]; then
+        echo ""
+        echo "Invitees will receive an email and need to accept it."
+        echo "You can also share this link: ${BLUE}https://github.com/${REPO}/invitations${NC}"
+    fi
+    
+    # Exit with error if any failed
+    [[ $FAILED -gt 0 ]] && exit 1
 fi
 
 # ------------------------------------------------------------------------------
@@ -336,30 +373,58 @@ fi
 # These are stubbed out for future development. Remove the comments and
 # implement them when you're ready!
 
-# TODO: Implement "remove" subcommand
-# if [[ "$SUBCOMMAND" == "remove" ]]; then
-#     info "Removing '${USERNAME}' from '${REPO}'..."
-#     if gh api "repos/${REPO}/collaborators/${USERNAME}" --method DELETE --silent; then
-#         success "Removed '${USERNAME}' from '${REPO}'"
-#     else
-#         die "Failed to remove collaborator"
-#     fi
-# fi
+# Handle the "remove" subcommand
+if [[ "$SUBCOMMAND" == "remove" ]]; then
+    FAILED=0
+    
+    for USERNAME in "${USERNAMES[@]}"; do
+        info "Removing '${YELLOW}${USERNAME}${NC}' from '${BLUE}${REPO}${NC}'..."
+        if gh api "repos/${REPO}/collaborators/${USERNAME}" --method DELETE --silent 2>/dev/null; then
+            success "Removed '${YELLOW}${USERNAME}${NC}'"
+        else
+            warn "Failed to remove '${YELLOW}${USERNAME}${NC}' - may not be a collaborator"
+            FAILED=$((FAILED + 1))
+        fi
+    done
+    
+    # Show summary for batch operations
+    if [[ ${#USERNAMES[@]} -gt 1 ]]; then
+        echo ""
+        SUCCEEDED=$((${#USERNAMES[@]} - FAILED))
+        if [[ $FAILED -eq 0 ]]; then
+            success "All ${SUCCEEDED} collaborators removed successfully!"
+        else
+            warn "${SUCCEEDED} succeeded, ${FAILED} failed"
+        fi
+    fi
+    
+    [[ $FAILED -gt 0 ]] && exit 1
+fi
 
-# TODO: Implement "list" subcommand  
-# if [[ "$SUBCOMMAND" == "list" ]]; then
-#     info "Collaborators for '${REPO}':"
-#     # The --jq flag uses jq syntax to format JSON output
-#     # .[].login extracts the 'login' field from each item in the array
-#     gh api "repos/${REPO}/collaborators" --jq '.[] | "\(.login) (\(.role_name))"'
-# fi
+# Handle the "list" subcommand
+if [[ "$SUBCOMMAND" == "list" ]]; then
+    info "Collaborators for '${BLUE}${REPO}${NC}':"
+    echo ""
+    # The --jq flag uses jq syntax to format JSON output
+    # .[].login extracts the 'login' field from each item in the array
+    if ! gh api "repos/${REPO}/collaborators" --jq '.[] | "  \(.login) (\(.role_name))"'; then
+        die "Failed to list collaborators. Check repo access."
+    fi
+fi
 
-# TODO: Implement "check" subcommand
-# if [[ "$SUBCOMMAND" == "check" ]]; then
-#     # This endpoint returns 204 if user is collaborator, 404 if not
-#     if gh api "repos/${REPO}/collaborators/${USERNAME}" --silent 2>/dev/null; then
-#         success "'${USERNAME}' is a collaborator on '${REPO}'"
-#     else
-#         warn "'${USERNAME}' is NOT a collaborator on '${REPO}'"
-#     fi
-# fi
+# Handle the "check" subcommand
+if [[ "$SUBCOMMAND" == "check" ]]; then
+    NOT_COLLABORATORS=0
+    
+    for USERNAME in "${USERNAMES[@]}"; do
+        # This endpoint returns 204 if user is collaborator, 404 if not
+        if gh api "repos/${REPO}/collaborators/${USERNAME}" --silent 2>/dev/null; then
+            success "'${YELLOW}${USERNAME}${NC}' is a collaborator on '${BLUE}${REPO}${NC}'"
+        else
+            warn "'${YELLOW}${USERNAME}${NC}' is NOT a collaborator on '${BLUE}${REPO}${NC}'"
+            NOT_COLLABORATORS=$((NOT_COLLABORATORS + 1))
+        fi
+    done
+    
+    [[ $NOT_COLLABORATORS -gt 0 ]] && exit 1
+fi

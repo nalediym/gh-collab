@@ -19,6 +19,21 @@ gh collab add octocat
 # Add a collaborator to a specific repo
 gh collab add octocat -R myorg/private-repo
 
+# Add with specific permission level
+gh collab add octocat --permission admin
+
+# Batch add multiple users
+gh collab add alice bob charlie
+
+# Remove a collaborator
+gh collab remove octocat
+
+# List all collaborators
+gh collab list
+
+# Check if a user is a collaborator
+gh collab check octocat
+
 # Show help
 gh collab --help
 ```
@@ -37,11 +52,11 @@ The default permission level is **push** (write access).
 
 These are documented as `TODO` comments in the source code. PRs welcome!
 
-- [ ] `gh collab remove <username>` - Remove a collaborator
-- [ ] `gh collab list` - List all collaborators with their permission levels
-- [ ] `gh collab check <username>` - Check if a user is already a collaborator
-- [ ] `--permission` flag to set access level (pull/push/admin/maintain/triage)
-- [ ] Batch add multiple users: `gh collab add user1 user2 user3`
+- [x] `gh collab remove <username>` - Remove a collaborator
+- [x] `gh collab list` - List all collaborators with their permission levels
+- [x] `gh collab check <username>` - Check if a user is already a collaborator
+- [x] `--permission` flag to set access level (pull/push/admin/maintain/triage)
+- [x] Batch add multiple users: `gh collab add user1 user2 user3`
 - [ ] Config file for default settings (`~/.config/gh-collab/config`)
 - [ ] Interactive mode with fuzzy user search
 - [ ] Support for organization teams
